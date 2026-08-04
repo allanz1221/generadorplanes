@@ -5,7 +5,7 @@ from io import BytesIO
 import re
 import json
 
-from flask import Flask, render_template, request, send_file
+from flask import Flask, render_template, request, send_file, redirect, url_for, session
 import pdfplumber
 from docx import Document
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
@@ -15,6 +15,8 @@ from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, RGBColor
 
 app = Flask(__name__)
+app.config["SECRET_KEY"] = "generador-planes-local-2026"
+app.config["MAX_CONTENT_LENGTH"] = 12 * 1024 * 1024
 DAY_NAMES = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
 
 # Síntesis de los contenidos y actividades del PDF proporcionado.
@@ -63,6 +65,32 @@ def clean_activities(raw: str) -> list[tuple[str, str]]:
             topic, separator, activity = line.partition("|")
             rows.append((topic.strip(), activity.strip() if separator and activity.strip() else "Actividad de aprendizaje por definir."))
     return rows or ACTIVITIES
+
+
+def extract_learning_activities(upload) -> list[tuple[str, str]]:
+    """Convierte la secuencia didáctica a pares Tema (Contenido) / Actividad."""
+    with pdfplumber.open(BytesIO(upload.read())) as pdf:
+        text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+    text = re.sub(r"[ \t]+", " ", text)
+    element_pattern = re.compile(r"Elemento de competencia\s+(\d+)\s*:\s*(.*?)(?=Elemento de competencia\s+\d+\s*:|\Z)", re.I | re.S)
+    result = []
+    for element in element_pattern.finditer(text):
+        number, block = element.group(1), element.group(2)
+        phase_pattern = re.compile(r"EC\s*" + re.escape(number) + r"\s+Fase\s+[IVX]+\s*:\s*(.*?)(?=\s+EC\s*" + re.escape(number) + r"\s+Fase\s+[IVX]+\s*:|\s+Evaluaci[óo]n formativa:|\Z)", re.I | re.S)
+        for phase in phase_pattern.finditer(block):
+            phase_block = phase.group(1)
+            content_match = re.search(r"Contenido:\s*(.*?)(?=\s+EC\s*" + re.escape(number) + r"\s+F\d+\s+Actividad de aprendizaje|\Z)", phase_block, re.I | re.S)
+            content = " ".join(content_match.group(1).split()) if content_match else f"Elemento de competencia {number}"
+            activity_pattern = re.compile(r"EC\s*" + re.escape(number) + r"\s+F\d+\s+Actividad de aprendizaje\s+(\d+)\s*:\s*(.*?)(?=\s+Tipo de actividad:|\s+EC\s*" + re.escape(number) + r"\s+F\d+\s+Actividad de aprendizaje|\Z)", re.I | re.S)
+            for activity in activity_pattern.finditer(phase_block):
+                activity_number = activity.group(1)
+                title = " ".join(activity.group(2).split())
+                if title.lower().startswith("tipo de actividad:"):
+                    title = re.sub(r"^Tipo de actividad:\s*", "", title, flags=re.I)
+                    title = re.split(r"\s+Aula\s*\(", title, maxsplit=1, flags=re.I)[0].strip()
+                if title:
+                    result.append((content, f"EC{number} Actividad de aprendizaje {activity_number}: {title}"))
+    return result
 
 
 def shade(cell, color: str) -> None:
@@ -181,8 +209,8 @@ app.add_template_filter(spanish_date_to_input, "date_input")
 
 @app.get("/")
 def index():
-    catalog = "\n".join(f"{topic} | {activity}" for topic, activity in ACTIVITIES)
-    return render_template("index.html", catalog=catalog, days=enumerate(DAY_NAMES), prefill={})
+    catalog = session.get("catalog", "\n".join(f"{topic} | {activity}" for topic, activity in ACTIVITIES))
+    return render_template("index.html", catalog=catalog, days=enumerate(DAY_NAMES), prefill=session.get("prefill", {}), extracted=bool(session.get("catalog")))
 
 
 @app.post("/subir-horario")
@@ -197,6 +225,21 @@ def upload_schedule():
     return render_template("confirmar.html", data=data)
 
 
+@app.post("/subir-secuencia")
+def upload_syllabus():
+    upload = request.files.get("syllabus")
+    if not upload or not upload.filename.lower().endswith(".pdf"):
+        return "Sube un PDF de secuencia didáctica.", 400
+    try:
+        activities = extract_learning_activities(upload)
+    except Exception:
+        return "No fue posible leer la secuencia didáctica. Verifica que sea un PDF válido.", 400
+    if not activities:
+        return "No se detectaron elementos de competencia ni actividades en el PDF.", 400
+    session["catalog"] = "\n".join(f"{topic} | {activity}" for topic, activity in activities)
+    return redirect(url_for("index"))
+
+
 @app.post("/usar-horario")
 def use_schedule():
     course = request.form.get("course", "")
@@ -206,8 +249,8 @@ def use_schedule():
         "end_date": request.form.get("end_date", ""), "weekly_hours": request.form.get("weekly_hours", ""),
         "selected_days": [int(value) for value in request.form.getlist("days")],
     }
-    catalog = "\n".join(f"{topic} | {activity}" for topic, activity in ACTIVITIES)
-    return render_template("index.html", catalog=catalog, days=enumerate(DAY_NAMES), prefill=prefill)
+    session["prefill"] = prefill
+    return redirect(url_for("index"))
 
 
 @app.post("/generar")
