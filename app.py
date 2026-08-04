@@ -3,8 +3,10 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from io import BytesIO
 import re
+import json
 
 from flask import Flask, render_template, request, send_file
+import pdfplumber
 from docx import Document
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -118,10 +120,94 @@ def make_docx(course: str, teacher: str, semester: str, hours: str, sessions: li
     return output
 
 
+def extract_schedule(upload) -> dict:
+    """Extrae campos administrativos y materias de un horario institucional en PDF."""
+    with pdfplumber.open(BytesIO(upload.read())) as pdf:
+        page = pdf.pages[0]
+        text = page.extract_text() or ""
+        words = page.extract_words()
+    def capture(pattern: str) -> str:
+        match = re.search(pattern, text, re.IGNORECASE)
+        return " ".join(match.group(1).split()) if match else ""
+    professor = capture(r"NOMBRE DEL PROFESOR:\s*(.*?)\s+NO\.\s*EMPLEADO")
+    program = capture(r"PE DE ADSCRIPCI[ÓO]N\s*(.*?)\s+CATEGORIA")
+    start = capture(r"FECHA INICIAL:\s*(.*?)\s+FECHA FINAL")
+    end = capture(r"FECHA FINAL:\s*(.*?)(?=\s+CLAVE DE MATERIA)")
+    # Las líneas de la tabla de materias tienen clave, grupo y horas; se agrupan
+    # por coordenada vertical para conservar los nombres que se parten en renglones.
+    code_words = [word for word in words if re.fullmatch(r"\d{3}[A-Z]{2}\d{3}", word["text"])]
+    courses = []
+    for word in code_words:
+        y = word["top"]
+        same_row = [w for w in words if abs(w["top"] - y) < 2 and w["x0"] > word["x1"]]
+        line = " ".join(w["text"] for w in same_row)
+        group = re.search(r"\b(\d{3})\b", line)
+        if not group:
+            continue
+        hour_match = re.search(r"\s+(\d+)\s+-\s+(\d+)\s+-\s+(\d+)", line[group.end():])
+        name = re.sub(r"\s+\d+\s+-\s+\d+\s+-\s+\d+.*$", "", line[group.end():]).strip()
+        weekly_hours = sum(map(int, hour_match.groups())) if hour_match else 0
+        courses.append({"code": word["text"], "group": group.group(1), "name": name or "Materia sin identificar", "weekly_hours": weekly_hours, "days": []})
+    unique = {(c["code"], c["group"]): c for c in courses}
+    courses = list(unique.values())
+    day_centers = [137, 219, 301, 383, 465, 547]
+    for word in words:
+        match = re.fullmatch(r"(\d{3}[A-Z]{2}\d{3})-(\d{3})", word["text"])
+        if not match or word["top"] < 180:
+            continue
+        key = (match.group(1), match.group(2))
+        if key in unique:
+            nearest_day = min(range(len(day_centers)), key=lambda index: abs(day_centers[index] - word["x0"]))
+            if abs(day_centers[nearest_day] - word["x0"]) < 45:
+                unique[key]["days"].append(nearest_day)
+    for course in courses:
+        course["days"] = sorted(set(course["days"]))
+    # Nombre de jefatura: se encuentra entre la firma docente y la leyenda de jefatura.
+    signature_words = [w for w in words if 700 <= w["top"] <= 718 and w["x0"] >= 350]
+    chief_name = " ".join(w["text"] for w in signature_words)
+    return {"professor": professor, "program": program, "start_text": start, "end_text": end, "chief": chief_name, "courses": courses}
+
+
+def spanish_date_to_input(value: str) -> str:
+    months = {"enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6, "julio": 7, "agosto": 8, "septiembre": 9, "octubre": 10, "noviembre": 11, "diciembre": 12}
+    match = re.search(r"(\d{1,2})\s+de\s+([a-záéíóú]+)\s+de\s+(\d{4})", value.lower())
+    if not match:
+        return ""
+    return f"{match.group(3)}-{months.get(match.group(2), 1):02d}-{int(match.group(1)):02d}"
+
+
+app.add_template_filter(spanish_date_to_input, "date_input")
+
+
 @app.get("/")
 def index():
     catalog = "\n".join(f"{topic} | {activity}" for topic, activity in ACTIVITIES)
-    return render_template("index.html", catalog=catalog, days=enumerate(DAY_NAMES))
+    return render_template("index.html", catalog=catalog, days=enumerate(DAY_NAMES), prefill={})
+
+
+@app.post("/subir-horario")
+def upload_schedule():
+    upload = request.files.get("schedule")
+    if not upload or not upload.filename.lower().endswith(".pdf"):
+        return "Sube un archivo PDF de horario.", 400
+    try:
+        data = extract_schedule(upload)
+    except Exception:
+        return "No fue posible leer el horario. Verifica que sea un PDF válido.", 400
+    return render_template("confirmar.html", data=data)
+
+
+@app.post("/usar-horario")
+def use_schedule():
+    course = request.form.get("course", "")
+    prefill = {
+        "course": course, "teacher": request.form.get("teacher", ""), "program": request.form.get("program", ""),
+        "chief": request.form.get("chief", ""), "start_date": request.form.get("start_date", ""),
+        "end_date": request.form.get("end_date", ""), "weekly_hours": request.form.get("weekly_hours", ""),
+        "selected_days": [int(value) for value in request.form.getlist("days")],
+    }
+    catalog = "\n".join(f"{topic} | {activity}" for topic, activity in ACTIVITIES)
+    return render_template("index.html", catalog=catalog, days=enumerate(DAY_NAMES), prefill=prefill)
 
 
 @app.post("/generar")
