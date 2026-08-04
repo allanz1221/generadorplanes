@@ -4,9 +4,13 @@ from datetime import date, datetime, timedelta
 from io import BytesIO
 import re
 import json
+import shutil
+import tempfile
+from pathlib import Path
 
 from flask import Flask, render_template, request, send_file, redirect, url_for, session
 import pdfplumber
+import win32com.client
 from docx import Document
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -17,6 +21,11 @@ from docx.shared import Cm, Pt, RGBColor
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "generador-planes-local-2026"
 app.config["MAX_CONTENT_LENGTH"] = 12 * 1024 * 1024
+BASE_DIR = Path(__file__).resolve().parent
+TEMPLATE_CANDIDATES = [
+    Path(r"C:\Users\PC\Desktop\2026-2\FormatoPlanClaseP11-F03.doc"),
+    BASE_DIR / "FormatoPlanClaseP11-F03.doc",
+]
 DAY_NAMES = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
 
 # Síntesis de los contenidos y actividades del PDF proporcionado.
@@ -148,6 +157,51 @@ def make_docx(course: str, teacher: str, semester: str, hours: str, sessions: li
     return output
 
 
+def make_template_docx(teacher: str, chief: str, sessions: list[dict]) -> BytesIO:
+    """Llena la plantilla Word original sin alterar el archivo fuente."""
+    template = next((path for path in TEMPLATE_CANDIDATES if path.exists()), None)
+    if not template:
+        raise FileNotFoundError("No se encontró la plantilla FormatoPlanClaseP11-F03.doc")
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp) / "plan_base.doc"
+        output = Path(tmp) / "plan_de_clase.docx"
+        shutil.copy2(template, work)
+        word = win32com.client.DispatchEx("Word.Application")
+        word.Visible = False
+        word.DisplayAlerts = 0
+        document = None
+        try:
+            document = word.Documents.Open(str(work), ReadOnly=False, AddToRecentFiles=False)
+            rows_by_element = {element: 3 for element in range(1, 5)}
+            for session_data in sessions:
+                element = session_data["element"]
+                if element not in rows_by_element or element > document.Tables.Count:
+                    continue
+                table = document.Tables.Item(element)
+                row = rows_by_element[element]
+                while row > table.Rows.Count:
+                    table.Rows.Add()
+                values = [str(session_data["number"]), session_data["date"], session_data["topic"], session_data["activity"]]
+                for column, value in enumerate(values, 1):
+                    table.Cell(row, column).Range.Text = value
+                rows_by_element[element] += 1
+            for element in range(1, min(4, document.Tables.Count) + 1):
+                document.Tables.Item(element).Cell(2, 1).Range.Text = f"ELEMENTO {element}:"
+            finder = document.Content.Find
+            finder.ClearFormatting()
+            finder.Replacement.ClearFormatting()
+            finder.Execute(FindText="XXXXXXXXX", ReplaceWith=teacher or "", Replace=2)
+            finder.Execute(FindText="XXXXXXXX", ReplaceWith=chief or "", Replace=2)
+            document.SaveAs2(str(output), 16)
+            document.Close(False)
+            document = None
+        finally:
+            if document is not None:
+                document.Close(False)
+            word.Quit()
+        return BytesIO(output.read_bytes())
+
+
 def extract_schedule(upload) -> dict:
     """Extrae campos administrativos y materias de un horario institucional en PDF."""
     with pdfplumber.open(BytesIO(upload.read())) as pdf:
@@ -209,8 +263,7 @@ app.add_template_filter(spanish_date_to_input, "date_input")
 
 @app.get("/")
 def index():
-    catalog = session.get("catalog", "\n".join(f"{topic} | {activity}" for topic, activity in ACTIVITIES))
-    return render_template("index.html", catalog=catalog, days=enumerate(DAY_NAMES), prefill=session.get("prefill", {}), extracted=bool(session.get("catalog")))
+    return render_template("index.html")
 
 
 @app.post("/subir-horario")
@@ -222,7 +275,8 @@ def upload_schedule():
         data = extract_schedule(upload)
     except Exception:
         return "No fue posible leer el horario. Verifica que sea un PDF válido.", 400
-    return render_template("confirmar.html", data=data)
+    session["schedule_data"] = data
+    return render_template("secuencia.html", data=data)
 
 
 @app.post("/subir-secuencia")
@@ -236,8 +290,11 @@ def upload_syllabus():
         return "No fue posible leer la secuencia didáctica. Verifica que sea un PDF válido.", 400
     if not activities:
         return "No se detectaron elementos de competencia ni actividades en el PDF.", 400
-    session["catalog"] = "\n".join(f"{topic} | {activity}" for topic, activity in activities)
-    return redirect(url_for("index"))
+    data = session.get("schedule_data")
+    if not data:
+        return redirect(url_for("index"))
+    catalog = "\n".join(f"{topic} | {activity}" for topic, activity in activities)
+    return render_template("confirmar.html", data=data, catalog=catalog)
 
 
 @app.post("/usar-horario")
@@ -270,7 +327,13 @@ def generate():
         return "No hay clases en los días seleccionados dentro de ese periodo.", 400
     activities = clean_activities(request.form.get("activities", ""))
     sessions = [{"number": index, "date": class_date.strftime("%d/%m/%Y"), "topic": activities[(index - 1) % len(activities)][0], "activity": activities[(index - 1) % len(activities)][1]} for index, class_date in enumerate(class_dates, 1)]
-    docx = make_docx(request.form.get("course", ""), request.form.get("teacher", ""), request.form.get("semester", ""), request.form.get("weekly_hours", ""), sessions)
+    for session_data in sessions:
+        match = re.match(r"EC\s*(\d+)", session_data["activity"], re.I)
+        session_data["element"] = int(match.group(1)) if match else 1
+    try:
+        docx = make_template_docx(request.form.get("teacher", ""), request.form.get("chief", ""), sessions)
+    except Exception as exc:
+        return f"No fue posible generar el documento desde la plantilla: {exc}", 500
     name = re.sub(r"[^A-Za-z0-9_-]+", "_", request.form.get("course", "plan_clase")).strip("_") or "plan_clase"
     return send_file(docx, as_attachment=True, download_name=f"{name}_plan_de_clase.docx", mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
