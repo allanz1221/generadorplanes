@@ -4,13 +4,10 @@ from datetime import date, datetime, timedelta
 from io import BytesIO
 import re
 import json
-import shutil
-import tempfile
 from pathlib import Path
 
 from flask import Flask, render_template, request, send_file, redirect, url_for, session
 import pdfplumber
-import win32com.client
 from docx import Document
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -22,10 +19,7 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = "generador-planes-local-2026"
 app.config["MAX_CONTENT_LENGTH"] = 12 * 1024 * 1024
 BASE_DIR = Path(__file__).resolve().parent
-TEMPLATE_CANDIDATES = [
-    Path(r"C:\Users\PC\Desktop\2026-2\FormatoPlanClaseP11-F03.doc"),
-    BASE_DIR / "FormatoPlanClaseP11-F03.doc",
-]
+TEMPLATE_PATH = BASE_DIR / "plantilla" / "FormatoPlanClaseP11-F03.docx"
 DAY_NAMES = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
 
 # Síntesis de los contenidos y actividades del PDF proporcionado.
@@ -158,48 +152,41 @@ def make_docx(course: str, teacher: str, semester: str, hours: str, sessions: li
 
 
 def make_template_docx(teacher: str, chief: str, sessions: list[dict]) -> BytesIO:
-    """Llena la plantilla Word original sin alterar el archivo fuente."""
-    template = next((path for path in TEMPLATE_CANDIDATES if path.exists()), None)
-    if not template:
-        raise FileNotFoundError("No se encontró la plantilla FormatoPlanClaseP11-F03.doc")
-    with tempfile.TemporaryDirectory() as tmp:
-        work = Path(tmp) / "plan_base.doc"
-        output = Path(tmp) / "plan_de_clase.docx"
-        shutil.copy2(template, work)
-        word = win32com.client.DispatchEx("Word.Application")
-        word.Visible = False
-        word.DisplayAlerts = 0
-        document = None
-        try:
-            document = word.Documents.Open(str(work), ReadOnly=False, AddToRecentFiles=False)
-            rows_by_element = {element: 3 for element in range(1, 5)}
-            for session_data in sessions:
-                element = session_data["element"]
-                if element not in rows_by_element or element > document.Tables.Count:
-                    continue
-                table = document.Tables.Item(element)
-                row = rows_by_element[element]
-                while row > table.Rows.Count:
-                    table.Rows.Add()
-                values = [str(session_data["number"]), session_data["date"], session_data["topic"], session_data["activity"]]
-                for column, value in enumerate(values, 1):
-                    table.Cell(row, column).Range.Text = value
-                rows_by_element[element] += 1
-            for element in range(1, min(4, document.Tables.Count) + 1):
-                document.Tables.Item(element).Cell(2, 1).Range.Text = f"ELEMENTO {element}:"
-            finder = document.Content.Find
-            finder.ClearFormatting()
-            finder.Replacement.ClearFormatting()
-            finder.Execute(FindText="XXXXXXXXX", ReplaceWith=teacher or "", Replace=2)
-            finder.Execute(FindText="XXXXXXXX", ReplaceWith=chief or "", Replace=2)
-            document.SaveAs2(str(output), 16)
-            document.Close(False)
-            document = None
-        finally:
-            if document is not None:
-                document.Close(False)
-            word.Quit()
-        return BytesIO(output.read_bytes())
+    """Llena una copia DOCX de la plantilla; funciona igual en Windows y Linux."""
+    if not TEMPLATE_PATH.exists():
+        raise FileNotFoundError("No se encontró la plantilla DOCX del proyecto")
+    document = Document(TEMPLATE_PATH)
+    rows_by_element = {element: 2 for element in range(1, 5)}
+    for session_data in sessions:
+        element = session_data["element"]
+        if element not in rows_by_element or element > len(document.tables):
+            continue
+        table = document.tables[element - 1]
+        row = rows_by_element[element]
+        while row >= len(table.rows):
+            table.add_row()
+        values = [str(session_data["number"]), session_data["date"], session_data["topic"], session_data["activity"]]
+        for column, value in enumerate(values):
+            table.cell(row, column).text = value
+        rows_by_element[element] += 1
+    for element in range(1, min(4, len(document.tables)) + 1):
+        document.tables[element - 1].cell(1, 0).text = f"ELEMENTO {element}:"
+    def replace_in_paragraph(paragraph, old, new):
+        if old in paragraph.text:
+            paragraph.text = paragraph.text.replace(old, new)
+    for paragraph in document.paragraphs:
+        replace_in_paragraph(paragraph, "XXXXXXXXX", teacher or "")
+        replace_in_paragraph(paragraph, "XXXXXXXX", chief or "")
+    for table in document.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    replace_in_paragraph(paragraph, "XXXXXXXXX", teacher or "")
+                    replace_in_paragraph(paragraph, "XXXXXXXX", chief or "")
+    output = BytesIO()
+    document.save(output)
+    output.seek(0)
+    return output
 
 
 def extract_schedule(upload) -> dict:
