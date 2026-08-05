@@ -70,15 +70,17 @@ def clean_activities(raw: str) -> list[tuple[str, str]]:
     return rows or ACTIVITIES
 
 
-def extract_learning_activities(upload) -> list[tuple[str, str]]:
+def extract_learning_activities(upload) -> tuple[list[tuple[str, str]], dict[str, str]]:
     """Convierte la secuencia didáctica a pares Tema (Contenido) / Actividad."""
     with pdfplumber.open(BytesIO(upload.read())) as pdf:
         text = "\n".join(page.extract_text() or "" for page in pdf.pages)
     text = re.sub(r"[ \t]+", " ", text)
     element_pattern = re.compile(r"Elemento de competencia\s+(\d+)\s*:\s*(.*?)(?=Elemento de competencia\s+\d+\s*:|\Z)", re.I | re.S)
-    result = []
+    result, element_names = [], {}
     for element in element_pattern.finditer(text):
         number, block = element.group(1), element.group(2)
+        name = re.split(r"Competencias blandas a promover:", block, maxsplit=1, flags=re.I)[0]
+        element_names[number] = " ".join(name.split()) or f"Elemento de competencia {number}"
         phase_pattern = re.compile(r"EC\s*" + re.escape(number) + r"\s+Fase\s+[IVX]+\s*:\s*(.*?)(?=\s+EC\s*" + re.escape(number) + r"\s+Fase\s+[IVX]+\s*:|\s+Evaluaci[óo]n formativa:|\Z)", re.I | re.S)
         for phase in phase_pattern.finditer(block):
             phase_block = phase.group(1)
@@ -93,7 +95,7 @@ def extract_learning_activities(upload) -> list[tuple[str, str]]:
                     title = re.split(r"\s+Aula\s*\(", title, maxsplit=1, flags=re.I)[0].strip()
                 if title:
                     result.append((content, f"EC{number} Actividad de aprendizaje {activity_number}: {title}"))
-    return result
+    return result, element_names
 
 
 def shade(cell, color: str) -> None:
@@ -151,7 +153,7 @@ def make_docx(course: str, teacher: str, semester: str, hours: str, sessions: li
     return output
 
 
-def make_template_docx(teacher: str, chief: str, sessions: list[dict]) -> BytesIO:
+def make_template_docx(teacher: str, chief: str, sessions: list[dict], element_names: dict[str, str]) -> BytesIO:
     """Llena una copia DOCX de la plantilla; funciona igual en Windows y Linux."""
     if not TEMPLATE_PATH.exists():
         raise FileNotFoundError("No se encontró la plantilla DOCX del proyecto")
@@ -170,7 +172,8 @@ def make_template_docx(teacher: str, chief: str, sessions: list[dict]) -> BytesI
             table.cell(row, column).text = value
         rows_by_element[element] += 1
     for element in range(1, min(4, len(document.tables)) + 1):
-        document.tables[element - 1].cell(1, 0).text = f"ELEMENTO {element}:"
+        element_name = element_names.get(str(element), "")
+        document.tables[element - 1].cell(1, 0).text = f"ELEMENTO {element}: {element_name}".strip()
     def replace_in_paragraph(paragraph, old, new):
         if old in paragraph.text:
             paragraph.text = paragraph.text.replace(old, new)
@@ -272,7 +275,7 @@ def upload_syllabus():
     if not upload or not upload.filename.lower().endswith(".pdf"):
         return "Sube un PDF de secuencia didáctica.", 400
     try:
-        activities = extract_learning_activities(upload)
+        activities, element_names = extract_learning_activities(upload)
     except Exception:
         return "No fue posible leer la secuencia didáctica. Verifica que sea un PDF válido.", 400
     if not activities:
@@ -281,7 +284,7 @@ def upload_syllabus():
     if not data:
         return redirect(url_for("index"))
     catalog = "\n".join(f"{topic} | {activity}" for topic, activity in activities)
-    return render_template("confirmar.html", data=data, catalog=catalog)
+    return render_template("confirmar.html", data=data, catalog=catalog, element_names=element_names)
 
 
 @app.post("/usar-horario")
@@ -320,12 +323,16 @@ def generate():
     if not class_dates:
         return "No hay clases en los días seleccionados dentro de ese periodo.", 400
     activities = clean_activities(request.form.get("activities", ""))
+    try:
+        element_names = json.loads(request.form.get("element_names", "{}"))
+    except json.JSONDecodeError:
+        element_names = {}
     sessions = [{"number": index, "date": class_date.strftime("%d/%m/%Y"), "topic": activities[(index - 1) % len(activities)][0], "activity": activities[(index - 1) % len(activities)][1]} for index, class_date in enumerate(class_dates, 1)]
     for session_data in sessions:
         match = re.match(r"EC\s*(\d+)", session_data["activity"], re.I)
         session_data["element"] = int(match.group(1)) if match else 1
     try:
-        docx = make_template_docx(request.form.get("teacher", ""), request.form.get("chief", ""), sessions)
+        docx = make_template_docx(request.form.get("teacher", ""), request.form.get("chief", ""), sessions, element_names)
     except Exception as exc:
         return f"No fue posible generar el documento desde la plantilla: {exc}", 500
     name = re.sub(r"[^A-Za-z0-9_-]+", "_", request.form.get("course", "plan_clase")).strip("_") or "plan_clase"
