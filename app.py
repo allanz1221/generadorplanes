@@ -153,23 +153,11 @@ def make_docx(course: str, teacher: str, semester: str, hours: str, sessions: li
     return output
 
 
-def make_template_docx(teacher: str, chief: str, program: str, course: str, sessions: list[dict], element_names: dict[str, str]) -> BytesIO:
+def make_template_docx(teacher: str, chief: str, sessions: list[dict], element_names: dict[str, str]) -> BytesIO:
     """Llena una copia DOCX de la plantilla; funciona igual en Windows y Linux."""
     if not TEMPLATE_PATH.exists():
         raise FileNotFoundError("No se encontró la plantilla DOCX del proyecto")
     document = Document(TEMPLATE_PATH)
-    header = document.sections[0].header
-    while len(header.paragraphs) < 7:
-        header.add_paragraph()
-    for paragraph, label, value in zip(
-        header.paragraphs[4:7],
-        ("Nombre del profesor: ", "Programa educativo: ", "Asignatura: "),
-        (teacher, program, course),
-    ):
-        paragraph.clear()
-        label_run = paragraph.add_run(label)
-        label_run.bold = True
-        paragraph.add_run(value or "Sin especificar")
     rows_by_element = {element: 2 for element in range(1, 5)}
     for session_data in sessions:
         element = session_data["element"]
@@ -339,15 +327,15 @@ def generate():
         element_names = json.loads(request.form.get("element_names", "{}"))
     except json.JSONDecodeError:
         element_names = {}
-    sessions = [{"number": index, "date": class_date.strftime("%d/%m/%Y"), "topic": activities[(index - 1) % len(activities)][0], "activity": activities[(index - 1) % len(activities)][1]} for index, class_date in enumerate(class_dates, 1)]
+    sessions = [
+        {"number": index, "date": class_date.strftime("%d/%m/%Y"), "topic": activity[0], "activity": activity[1]}
+        for index, (class_date, activity) in enumerate(zip(class_dates, activities), 1)
+    ]
     for session_data in sessions:
         match = re.match(r"EC\s*(\d+)", session_data["activity"], re.I)
         session_data["element"] = int(match.group(1)) if match else 1
     try:
-        docx = make_template_docx(
-            request.form.get("teacher", ""), request.form.get("chief", ""), request.form.get("program", ""),
-            request.form.get("course", ""), sessions, element_names,
-        )
+        docx = make_template_docx(request.form.get("teacher", ""), request.form.get("chief", ""), sessions, element_names)
     except Exception as exc:
         return f"No fue posible generar el documento desde la plantilla: {exc}", 500
     name = re.sub(r"[^A-Za-z0-9_-]+", "_", request.form.get("course", "plan_clase")).strip("_") or "plan_clase"
