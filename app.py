@@ -309,6 +309,13 @@ def generate():
     days = {int(day) for day in request.form.getlist("days")}
     if not days:
         return "Selecciona por lo menos un día de clase.", 400
+    try:
+        hours_by_day = {day: float(request.form.get(f"day_hours_{day}", "0")) for day in days}
+    except ValueError:
+        return "Indica horas válidas para cada día seleccionado.", 400
+    if any(hours <= 0 for hours in hours_by_day.values()):
+        return "Indica las horas para cada día seleccionado.", 400
+    weekly_hours = sum(hours_by_day.values())
     class_dates = scheduled_dates(start, end, days)
     if not class_dates:
         return "No hay clases en los días seleccionados dentro de ese periodo.", 400
