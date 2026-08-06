@@ -70,15 +70,75 @@ def clean_activities(raw: str) -> list[tuple[str, str]]:
     return rows or ACTIVITIES
 
 
-def extract_learning_activities(upload) -> list[tuple[str, str]]:
+def distribute_activities(class_dates: list[date], activities: list[tuple[str, str]]) -> list[tuple[date, tuple[str, str]]]:
+    """Reparte las actividades en todas las fechas sin perder la secuencia del curso."""
+    if not class_dates or not activities:
+        return []
+    total_dates, total_activities = len(class_dates), len(activities)
+    return [
+        (class_date, activities[min((index * total_activities) // total_dates, total_activities - 1)])
+        for index, class_date in enumerate(class_dates)
+    ]
+
+
+def group_sessions(class_dates: list[date], activities: list[tuple[str, str]]) -> list[dict]:
+    """Agrupa fechas consecutivas asignadas a una actividad en un solo renglón."""
+    groups: list[tuple[tuple[str, str], list[tuple[int, date]]]] = []
+    for number, (class_date, activity) in enumerate(distribute_activities(class_dates, activities), 1):
+        if not groups or groups[-1][0] != activity:
+            groups.append((activity, []))
+        groups[-1][1].append((number, class_date))
+    sessions = []
+    for activity, occurrences in groups:
+        numbers = ", ".join(str(number) for number, _ in occurrences)
+        first_date, last_date = occurrences[0][1], occurrences[-1][1]
+        date_text = first_date.strftime("%d/%m/%Y")
+        if last_date != first_date:
+            date_text += f" - {last_date.strftime('%d/%m/%Y')}"
+        sessions.append({"number": numbers, "date": date_text, "topic": activity[0], "activity": activity[1]})
+    return sessions
+
+
+def extract_activity_titles(pages) -> dict[tuple[str, str], str]:
+    """Reconstruye títulos partidos por las dos columnas visuales del PDF."""
+    page_rows = []
+    pattern = re.compile(r"EC(\d+)\s+F\d+\s+Actividad de aprendizaje\s+(\d+):\s*(.*)", re.I)
+    for page in pages:
+        rows = {}
+        for word in page.extract_words():
+            if word["x0"] < 295:
+                rows.setdefault(round(word["top"], 1), []).append(word)
+        page_rows.append([(y, " ".join(w["text"] for w in sorted(words, key=lambda item: item["x0"]))) for y, words in sorted(rows.items())])
+    titles = {}
+    for page_index, rows in enumerate(page_rows):
+        for row_index, (start_y, line) in enumerate(rows):
+            match = pattern.match(line)
+            if not match:
+                continue
+            parts, previous_y = [match.group(3)], start_y
+            next_index = row_index + 1
+            while next_index < len(rows) and rows[next_index][0] - previous_y <= 15:
+                parts.append(rows[next_index][1])
+                previous_y = rows[next_index][0]
+                next_index += 1
+            title = " ".join(part for part in parts if part).strip()
+            titles[(match.group(1), match.group(2))] = re.sub(r"-\s+", "-", title)
+    return titles
+
+
+def extract_learning_activities(upload) -> tuple[list[tuple[str, str]], dict[str, str]]:
     """Convierte la secuencia didáctica a pares Tema (Contenido) / Actividad."""
     with pdfplumber.open(BytesIO(upload.read())) as pdf:
-        text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+        pages = pdf.pages
+        text = "\n".join(page.extract_text() or "" for page in pages)
+        visual_titles = extract_activity_titles(pages)
     text = re.sub(r"[ \t]+", " ", text)
     element_pattern = re.compile(r"Elemento de competencia\s+(\d+)\s*:\s*(.*?)(?=Elemento de competencia\s+\d+\s*:|\Z)", re.I | re.S)
-    result = []
+    result, element_names = [], {}
     for element in element_pattern.finditer(text):
         number, block = element.group(1), element.group(2)
+        name = re.split(r"Competencias blandas a promover:", block, maxsplit=1, flags=re.I)[0]
+        element_names[number] = " ".join(name.split()) or f"Elemento de competencia {number}"
         phase_pattern = re.compile(r"EC\s*" + re.escape(number) + r"\s+Fase\s+[IVX]+\s*:\s*(.*?)(?=\s+EC\s*" + re.escape(number) + r"\s+Fase\s+[IVX]+\s*:|\s+Evaluaci[óo]n formativa:|\Z)", re.I | re.S)
         for phase in phase_pattern.finditer(block):
             phase_block = phase.group(1)
@@ -87,13 +147,13 @@ def extract_learning_activities(upload) -> list[tuple[str, str]]:
             activity_pattern = re.compile(r"EC\s*" + re.escape(number) + r"\s+F\d+\s+Actividad de aprendizaje\s+(\d+)\s*:\s*(.*?)(?=\s+Tipo de actividad:|\s+EC\s*" + re.escape(number) + r"\s+F\d+\s+Actividad de aprendizaje|\Z)", re.I | re.S)
             for activity in activity_pattern.finditer(phase_block):
                 activity_number = activity.group(1)
-                title = " ".join(activity.group(2).split())
+                title = visual_titles.get((number, activity_number), " ".join(activity.group(2).split()))
                 if title.lower().startswith("tipo de actividad:"):
                     title = re.sub(r"^Tipo de actividad:\s*", "", title, flags=re.I)
                     title = re.split(r"\s+Aula\s*\(", title, maxsplit=1, flags=re.I)[0].strip()
                 if title:
                     result.append((content, f"EC{number} Actividad de aprendizaje {activity_number}: {title}"))
-    return result
+    return result, element_names
 
 
 def shade(cell, color: str) -> None:
@@ -151,7 +211,7 @@ def make_docx(course: str, teacher: str, semester: str, hours: str, sessions: li
     return output
 
 
-def make_template_docx(teacher: str, chief: str, sessions: list[dict]) -> BytesIO:
+def make_template_docx(teacher: str, chief: str, sessions: list[dict], element_names: dict[str, str]) -> BytesIO:
     """Llena una copia DOCX de la plantilla; funciona igual en Windows y Linux."""
     if not TEMPLATE_PATH.exists():
         raise FileNotFoundError("No se encontró la plantilla DOCX del proyecto")
@@ -169,8 +229,14 @@ def make_template_docx(teacher: str, chief: str, sessions: list[dict]) -> BytesI
         for column, value in enumerate(values):
             table.cell(row, column).text = value
         rows_by_element[element] += 1
+    # La plantilla contiene filas de reserva; se eliminan las que no recibieron una sesión.
     for element in range(1, min(4, len(document.tables)) + 1):
-        document.tables[element - 1].cell(1, 0).text = f"ELEMENTO {element}:"
+        table = document.tables[element - 1]
+        while len(table.rows) > rows_by_element[element]:
+            table._tbl.remove(table.rows[-1]._tr)
+    for element in range(1, min(4, len(document.tables)) + 1):
+        element_name = element_names.get(str(element), "")
+        document.tables[element - 1].cell(1, 0).text = f"ELEMENTO {element}: {element_name}".strip()
     def replace_in_paragraph(paragraph, old, new):
         if old in paragraph.text:
             paragraph.text = paragraph.text.replace(old, new)
@@ -272,7 +338,7 @@ def upload_syllabus():
     if not upload or not upload.filename.lower().endswith(".pdf"):
         return "Sube un PDF de secuencia didáctica.", 400
     try:
-        activities = extract_learning_activities(upload)
+        activities, element_names = extract_learning_activities(upload)
     except Exception:
         return "No fue posible leer la secuencia didáctica. Verifica que sea un PDF válido.", 400
     if not activities:
@@ -281,7 +347,7 @@ def upload_syllabus():
     if not data:
         return redirect(url_for("index"))
     catalog = "\n".join(f"{topic} | {activity}" for topic, activity in activities)
-    return render_template("confirmar.html", data=data, catalog=catalog)
+    return render_template("confirmar.html", data=data, catalog=catalog, element_names=element_names)
 
 
 @app.post("/usar-horario")
@@ -309,16 +375,27 @@ def generate():
     days = {int(day) for day in request.form.getlist("days")}
     if not days:
         return "Selecciona por lo menos un día de clase.", 400
+    try:
+        hours_by_day = {day: float(request.form.get(f"day_hours_{day}", "0")) for day in days}
+    except ValueError:
+        return "Indica horas válidas para cada día seleccionado.", 400
+    if any(hours <= 0 for hours in hours_by_day.values()):
+        return "Indica las horas para cada día seleccionado.", 400
+    weekly_hours = sum(hours_by_day.values())
     class_dates = scheduled_dates(start, end, days)
     if not class_dates:
         return "No hay clases en los días seleccionados dentro de ese periodo.", 400
     activities = clean_activities(request.form.get("activities", ""))
-    sessions = [{"number": index, "date": class_date.strftime("%d/%m/%Y"), "topic": activities[(index - 1) % len(activities)][0], "activity": activities[(index - 1) % len(activities)][1]} for index, class_date in enumerate(class_dates, 1)]
+    try:
+        element_names = json.loads(request.form.get("element_names", "{}"))
+    except json.JSONDecodeError:
+        element_names = {}
+    sessions = group_sessions(class_dates, activities)
     for session_data in sessions:
         match = re.match(r"EC\s*(\d+)", session_data["activity"], re.I)
         session_data["element"] = int(match.group(1)) if match else 1
     try:
-        docx = make_template_docx(request.form.get("teacher", ""), request.form.get("chief", ""), sessions)
+        docx = make_template_docx(request.form.get("teacher", ""), request.form.get("chief", ""), sessions, element_names)
     except Exception as exc:
         return f"No fue posible generar el documento desde la plantilla: {exc}", 500
     name = re.sub(r"[^A-Za-z0-9_-]+", "_", request.form.get("course", "plan_clase")).strip("_") or "plan_clase"
