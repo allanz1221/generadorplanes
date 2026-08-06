@@ -99,10 +99,39 @@ def group_sessions(class_dates: list[date], activities: list[tuple[str, str]]) -
     return sessions
 
 
+def extract_activity_titles(pages) -> dict[tuple[str, str], str]:
+    """Reconstruye títulos partidos por las dos columnas visuales del PDF."""
+    page_rows = []
+    pattern = re.compile(r"EC(\d+)\s+F\d+\s+Actividad de aprendizaje\s+(\d+):\s*(.*)", re.I)
+    for page in pages:
+        rows = {}
+        for word in page.extract_words():
+            if word["x0"] < 295:
+                rows.setdefault(round(word["top"], 1), []).append(word)
+        page_rows.append([(y, " ".join(w["text"] for w in sorted(words, key=lambda item: item["x0"]))) for y, words in sorted(rows.items())])
+    titles = {}
+    for page_index, rows in enumerate(page_rows):
+        for row_index, (start_y, line) in enumerate(rows):
+            match = pattern.match(line)
+            if not match:
+                continue
+            parts, previous_y = [match.group(3)], start_y
+            next_index = row_index + 1
+            while next_index < len(rows) and rows[next_index][0] - previous_y <= 15:
+                parts.append(rows[next_index][1])
+                previous_y = rows[next_index][0]
+                next_index += 1
+            title = " ".join(part for part in parts if part).strip()
+            titles[(match.group(1), match.group(2))] = re.sub(r"-\s+", "-", title)
+    return titles
+
+
 def extract_learning_activities(upload) -> tuple[list[tuple[str, str]], dict[str, str]]:
     """Convierte la secuencia didáctica a pares Tema (Contenido) / Actividad."""
     with pdfplumber.open(BytesIO(upload.read())) as pdf:
-        text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+        pages = pdf.pages
+        text = "\n".join(page.extract_text() or "" for page in pages)
+        visual_titles = extract_activity_titles(pages)
     text = re.sub(r"[ \t]+", " ", text)
     element_pattern = re.compile(r"Elemento de competencia\s+(\d+)\s*:\s*(.*?)(?=Elemento de competencia\s+\d+\s*:|\Z)", re.I | re.S)
     result, element_names = [], {}
@@ -118,7 +147,7 @@ def extract_learning_activities(upload) -> tuple[list[tuple[str, str]], dict[str
             activity_pattern = re.compile(r"EC\s*" + re.escape(number) + r"\s+F\d+\s+Actividad de aprendizaje\s+(\d+)\s*:\s*(.*?)(?=\s+Tipo de actividad:|\s+EC\s*" + re.escape(number) + r"\s+F\d+\s+Actividad de aprendizaje|\Z)", re.I | re.S)
             for activity in activity_pattern.finditer(phase_block):
                 activity_number = activity.group(1)
-                title = " ".join(activity.group(2).split())
+                title = visual_titles.get((number, activity_number), " ".join(activity.group(2).split()))
                 if title.lower().startswith("tipo de actividad:"):
                     title = re.sub(r"^Tipo de actividad:\s*", "", title, flags=re.I)
                     title = re.split(r"\s+Aula\s*\(", title, maxsplit=1, flags=re.I)[0].strip()
