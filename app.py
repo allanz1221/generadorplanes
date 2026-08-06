@@ -81,6 +81,24 @@ def distribute_activities(class_dates: list[date], activities: list[tuple[str, s
     ]
 
 
+def group_sessions(class_dates: list[date], activities: list[tuple[str, str]]) -> list[dict]:
+    """Agrupa fechas consecutivas asignadas a una actividad en un solo renglón."""
+    groups: list[tuple[tuple[str, str], list[tuple[int, date]]]] = []
+    for number, (class_date, activity) in enumerate(distribute_activities(class_dates, activities), 1):
+        if not groups or groups[-1][0] != activity:
+            groups.append((activity, []))
+        groups[-1][1].append((number, class_date))
+    sessions = []
+    for activity, occurrences in groups:
+        numbers = ", ".join(str(number) for number, _ in occurrences)
+        first_date, last_date = occurrences[0][1], occurrences[-1][1]
+        date_text = first_date.strftime("%d/%m/%Y")
+        if last_date != first_date:
+            date_text += f" - {last_date.strftime('%d/%m/%Y')}"
+        sessions.append({"number": numbers, "date": date_text, "topic": activity[0], "activity": activity[1]})
+    return sessions
+
+
 def extract_learning_activities(upload) -> tuple[list[tuple[str, str]], dict[str, str]]:
     """Convierte la secuencia didáctica a pares Tema (Contenido) / Actividad."""
     with pdfplumber.open(BytesIO(upload.read())) as pdf:
@@ -343,10 +361,7 @@ def generate():
         element_names = json.loads(request.form.get("element_names", "{}"))
     except json.JSONDecodeError:
         element_names = {}
-    sessions = [
-        {"number": index, "date": class_date.strftime("%d/%m/%Y"), "topic": activity[0], "activity": activity[1]}
-        for index, (class_date, activity) in enumerate(distribute_activities(class_dates, activities), 1)
-    ]
+    sessions = group_sessions(class_dates, activities)
     for session_data in sessions:
         match = re.match(r"EC\s*(\d+)", session_data["activity"], re.I)
         session_data["element"] = int(match.group(1)) if match else 1
