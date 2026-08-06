@@ -70,6 +70,17 @@ def clean_activities(raw: str) -> list[tuple[str, str]]:
     return rows or ACTIVITIES
 
 
+def distribute_activities(class_dates: list[date], activities: list[tuple[str, str]]) -> list[tuple[date, tuple[str, str]]]:
+    """Reparte las actividades en todas las fechas sin perder la secuencia del curso."""
+    if not class_dates or not activities:
+        return []
+    total_dates, total_activities = len(class_dates), len(activities)
+    return [
+        (class_date, activities[min((index * total_activities) // total_dates, total_activities - 1)])
+        for index, class_date in enumerate(class_dates)
+    ]
+
+
 def extract_learning_activities(upload) -> tuple[list[tuple[str, str]], dict[str, str]]:
     """Convierte la secuencia didáctica a pares Tema (Contenido) / Actividad."""
     with pdfplumber.open(BytesIO(upload.read())) as pdf:
@@ -171,6 +182,11 @@ def make_template_docx(teacher: str, chief: str, sessions: list[dict], element_n
         for column, value in enumerate(values):
             table.cell(row, column).text = value
         rows_by_element[element] += 1
+    # La plantilla contiene filas de reserva; se eliminan las que no recibieron una sesión.
+    for element in range(1, min(4, len(document.tables)) + 1):
+        table = document.tables[element - 1]
+        while len(table.rows) > rows_by_element[element]:
+            table._tbl.remove(table.rows[-1]._tr)
     for element in range(1, min(4, len(document.tables)) + 1):
         element_name = element_names.get(str(element), "")
         document.tables[element - 1].cell(1, 0).text = f"ELEMENTO {element}: {element_name}".strip()
@@ -329,7 +345,7 @@ def generate():
         element_names = {}
     sessions = [
         {"number": index, "date": class_date.strftime("%d/%m/%Y"), "topic": activity[0], "activity": activity[1]}
-        for index, (class_date, activity) in enumerate(zip(class_dates, activities), 1)
+        for index, (class_date, activity) in enumerate(distribute_activities(class_dates, activities), 1)
     ]
     for session_data in sessions:
         match = re.match(r"EC\s*(\d+)", session_data["activity"], re.I)
